@@ -32,8 +32,14 @@ wp-config.php
 # Log files
 *.log
 
+# Temporary build artifacts
+out.json
+
 # htaccess
 /.htaccess
+
+# Secrets directory (contains sensitive configuration)
+/secrets/
 
 # All plugins
 #
@@ -46,3 +52,5 @@ wp-config.php
 # Note: If you wish to whitelist themes,
 # uncomment the next line
 #/wp-content/themes
+secrets/
+

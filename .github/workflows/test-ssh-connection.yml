@@ -1,0 +1,121 @@
+# Test SSH Connection Workflow
+# This workflow ONLY tests the SSH connection and lists pages
+# It does NOT publish or modify anything
+# Safe to run anytime via workflow_dispatch
+
+name: Test SSH Connection
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        env:
+          SSH_HOST: ${{ secrets.SITEGROUND_SSH_HOST }}
+          SSH_USER: ${{ secrets.SITEGROUND_SSH_USER }}
+          SSH_KEY: ${{ secrets.SITEGROUND_SSH_KEY }}
+          SSH_PASSPHRASE: ${{ secrets.SITEGROUND_SSH_PASSPHRASE }}
+          SSH_PORT: 18765
+        run: |
+          # Install expect for passphrase handling
+          sudo apt-get update && sudo apt-get install -y expect
+
+          # Create SSH directory
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Add SSH key (preserve newlines) - handle ED25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          # Verify key was written
+          if [ ! -s ~/.ssh/id_ed25519 ]; then
+            echo "Error: SSH key file is empty"
+            exit 1
+          fi
+          echo "SSH key file created ($(wc -l < ~/.ssh/id_ed25519) lines)"
+
+          # Setup SSH agent
+          eval "$(ssh-agent -s)"
+
+          # Add key to agent with passphrase
+          if [ -n "$SSH_PASSPHRASE" ]; then
+            echo "Adding SSH key with passphrase to agent..."
+            # Use expect to handle passphrase
+            expect -c "
+              set timeout 10
+              spawn ssh-add $::env(HOME)/.ssh/id_ed25519
+              expect \"Enter passphrase for\"
+              send \"$::env(SSH_PASSPHRASE)\r\"
+              expect eof
+            "
+          else
+            echo "Adding SSH key without passphrase to agent..."
+            ssh-add ~/.ssh/id_ed25519
+          fi
+
+          # Add known hosts
+          ssh-keyscan -p $SSH_PORT -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # Test SSH connection
+          echo "Testing SSH connection..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            -p $SSH_PORT \
+            $SSH_USER@$SSH_HOST \
+            "echo '✓ SSH connection successful'"
+
+      - name: Test WP-CLI (Read-Only)
+        env:
+          SSH_HOST: ${{ secrets.SITEGROUND_SSH_HOST }}
+          SSH_USER: ${{ secrets.SITEGROUND_SSH_USER }}
+          SSH_PASSPHRASE: ${{ secrets.SITEGROUND_SSH_PASSPHRASE }}
+          SSH_PORT: 18765
+          WP_PATH: ${{ secrets.SITEGROUND_WP_PATH }}
+        run: |
+          # Restart SSH agent and re-add key for this step
+          eval "$(ssh-agent -s)"
+
+          # Add key with passphrase if provided
+          if [ -n "$SSH_PASSPHRASE" ]; then
+            expect -c "
+              set timeout 10
+              spawn ssh-add $::env(HOME)/.ssh/id_ed25519
+              expect \"Enter passphrase for\"
+              send \"$::env(SSH_PASSPHRASE)\r\"
+              expect eof
+            "
+          else
+            ssh-add ~/.ssh/id_ed25519
+          fi
+
+          echo "Testing WP-CLI availability..."
+          ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+            "cd $WP_PATH && wp --info"
+
+          echo ""
+          echo "Listing all WordPress pages (read-only)..."
+          ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+            "cd $WP_PATH && wp post list --post_type=page --format=table"
+
+          echo ""
+          echo "Checking if 'speaker-bio' page exists..."
+          PAGE_ID=$(ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+            "cd $WP_PATH && wp post list --post_type=page --name='speaker-bio' --field=ID --format=csv 2>/dev/null | head -n1" || echo "")
+
+          if [ -n "$PAGE_ID" ] && [ "$PAGE_ID" != "ID" ]; then
+            echo "⚠ Page 'speaker-bio' already exists (ID: $PAGE_ID)"
+            echo "The main workflow will UPDATE this page."
+          else
+            echo "✓ Page 'speaker-bio' does not exist"
+            echo "The main workflow will CREATE this page."
+          fi
+
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "✓ All SSH and WP-CLI tests passed!"
+          echo "Your configuration is working correctly."
+          echo "You can now safely run the main publishing workflow."
+          echo "═══════════════════════════════════════════════════════════"

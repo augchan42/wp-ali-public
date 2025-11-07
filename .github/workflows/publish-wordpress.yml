@@ -1,0 +1,276 @@
+# WordPress Publishing Workflow via SSH + WP-CLI
+#
+# This workflow automatically publishes Markdown files from pages/ directory to WordPress
+# using SSH connection and WP-CLI commands.
+#
+# Best Practices Implemented:
+# - Direct SSH connection bypasses HTTP/API security layers
+# - WP-CLI commands for reliable WordPress operations
+# - Comprehensive error handling
+# - JSON validation before processing
+# - Detailed logging for debugging
+#
+# Deployment Safety:
+# - Only deploy on workdays (avoid Fridays after 4 PM)
+# - Test on staging before production
+# - Monitor workflow logs for errors
+# - Use git revert to rollback if needed
+#
+# Requirements:
+# - GitHub Secrets: SITEGROUND_SSH_HOST, SITEGROUND_SSH_USER, SITEGROUND_SSH_KEY, SITEGROUND_SSH_PASSPHRASE, SITEGROUND_WP_PATH
+# - WP-CLI installed on server (SiteGround has this by default)
+# - SSH key with proper permissions
+
+name: Publish WordPress Pages
+on:
+  push:
+    branches: [ main ]
+    paths: [ "pages/**/*.md" ]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Convert Markdown to HTML
+        run: |
+          # Install dependencies
+          python3 -m pip install --upgrade pip
+          python3 -m pip install markdown
+          sudo apt-get update && sudo apt-get install -y jq
+
+          # Convert markdown files to JSON with proper title extraction
+          python3 - << 'PYEOF'
+          import glob, markdown, json, pathlib, re
+
+          pages = []
+          for p in glob.glob('pages/**/*.md', recursive=True):
+              content = open(p, encoding='utf-8').read()
+
+              # Extract first heading as title (if exists)
+              heading_match = re.match(r'^#\s+(.+?)$', content, re.MULTILINE)
+              if heading_match:
+                  title = heading_match.group(1).strip()
+                  # Remove the heading from content
+                  content = re.sub(r'^#\s+.+?\n', '', content, count=1)
+              else:
+                  # Fallback to filename if no heading found
+                  title = pathlib.Path(p).stem.replace('-', ' ').title()
+
+              slug = pathlib.Path(p).stem.lower().replace(' ', '-')
+              html_content = markdown.markdown(content)
+
+              pages.append({'title': title, 'slug': slug, 'content': html_content})
+
+          open('out.json', 'w', encoding='utf-8').write(json.dumps(pages, ensure_ascii=False, indent=2))
+          print(f'Prepared {len(pages)} page(s) for publishing')
+          PYEOF
+
+          # Verify the JSON is valid
+          if [ ! -s out.json ]; then
+            echo "Error: out.json is empty or does not exist"
+            exit 1
+          fi
+
+          if ! jq empty out.json 2>/dev/null; then
+            echo "Error: out.json contains invalid JSON"
+            cat out.json
+            exit 1
+          fi
+
+          echo "Generated JSON for $(jq 'length' out.json) pages"
+
+      - name: Setup SSH
+        env:
+          SSH_HOST: ${{ secrets.SITEGROUND_SSH_HOST }}
+          SSH_USER: ${{ secrets.SITEGROUND_SSH_USER }}
+          SSH_KEY: ${{ secrets.SITEGROUND_SSH_KEY }}
+          SSH_PASSPHRASE: ${{ secrets.SITEGROUND_SSH_PASSPHRASE }}
+          SSH_PORT: 18765
+        run: |
+          # Install expect for passphrase handling if needed
+          sudo apt-get update && sudo apt-get install -y expect
+
+          # Create SSH directory
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Add SSH key (preserve newlines) - handle ED25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          # Verify key was written
+          if [ ! -s ~/.ssh/id_ed25519 ]; then
+            echo "Error: SSH key file is empty"
+            exit 1
+          fi
+          echo "SSH key file created ($(wc -l < ~/.ssh/id_ed25519) lines)"
+
+          # Setup SSH agent for passphrase-protected keys
+          eval "$(ssh-agent -s)"
+
+          # Add key to agent with passphrase
+          if [ -n "$SSH_PASSPHRASE" ]; then
+            echo "Adding SSH key with passphrase to agent..."
+            # Use expect to handle passphrase
+            expect -c "
+              set timeout 10
+              spawn ssh-add $::env(HOME)/.ssh/id_ed25519
+              expect \"Enter passphrase for\"
+              send \"$::env(SSH_PASSPHRASE)\r\"
+              expect eof
+            "
+          else
+            echo "Adding SSH key without passphrase to agent..."
+            ssh-add ~/.ssh/id_ed25519
+          fi
+
+          # Add known hosts (SiteGround SSH fingerprint)
+          ssh-keyscan -p $SSH_PORT -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # Test SSH connection
+          echo "Testing SSH connection..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            -p $SSH_PORT \
+            $SSH_USER@$SSH_HOST \
+            "echo 'SSH connection successful'"
+
+      - name: Publish via SSH + WP-CLI
+        env:
+          SSH_HOST: ${{ secrets.SITEGROUND_SSH_HOST }}
+          SSH_USER: ${{ secrets.SITEGROUND_SSH_USER }}
+          SSH_PASSPHRASE: ${{ secrets.SITEGROUND_SSH_PASSPHRASE }}
+          SSH_PORT: 18765
+          WP_PATH: ${{ secrets.SITEGROUND_WP_PATH }}
+        run: |
+          # Restart SSH agent and re-add key for this step
+          eval "$(ssh-agent -s)"
+
+          # Add key with passphrase if provided
+          if [ -n "$SSH_PASSPHRASE" ]; then
+            expect -c "
+              set timeout 10
+              spawn ssh-add $::env(HOME)/.ssh/id_ed25519
+              expect \"Enter passphrase for\"
+              send \"$::env(SSH_PASSPHRASE)\r\"
+              expect eof
+            "
+          else
+            ssh-add ~/.ssh/id_ed25519
+          fi
+
+          # Check if out.json exists and is valid
+          if [ ! -f out.json ] || [ ! -s out.json ]; then
+            echo "No pages to publish (out.json is missing or empty)"
+            exit 0
+          fi
+
+          if ! jq empty out.json 2>/dev/null; then
+            echo "Error: out.json contains invalid JSON"
+            cat out.json
+            exit 1
+          fi
+
+          page_count=$(jq 'length' out.json)
+          echo "Publishing $page_count page(s)..."
+
+          # Process each page
+          for i in $(seq 0 $((page_count - 1))); do
+            title=$(jq -r ".[$i].title" out.json)
+            slug=$(jq -r ".[$i].slug" out.json)
+            content=$(jq -r ".[$i].content" out.json)
+
+            # Escape content for shell
+            content_escaped=$(echo "$content" | sed "s/'/'\\\\''/g")
+
+            echo "Processing: $slug (title: $title)"
+
+            # Check if page exists
+            page_id=$(ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+              "cd $WP_PATH && wp post list --post_type=page --name='$slug' --field=ID --format=csv" 2>/dev/null | head -n1)
+
+            if [ -n "$page_id" ] && [ "$page_id" != "ID" ]; then
+              # Update existing page
+              echo "  Updating existing page #$page_id..."
+              ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+                "cd $WP_PATH && wp post update $page_id --post_title='$title' --post_content='$content_escaped' --post_status=publish"
+
+              if [ $? -eq 0 ]; then
+                echo "  ✓ Updated: $slug (#$page_id)"
+              else
+                echo "  ✗ Failed to update $slug"
+              fi
+            else
+              # Create new page
+              echo "  Creating new page..."
+              new_page_id=$(ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+                "cd $WP_PATH && wp post create --post_type=page --post_title='$title' --post_name='$slug' --post_content='$content_escaped' --post_status=publish --porcelain")
+
+              if [ $? -eq 0 ] && [ -n "$new_page_id" ]; then
+                echo "  ✓ Created: $slug (#$new_page_id)"
+              else
+                echo "  ✗ Failed to create $slug"
+              fi
+            fi
+          done
+
+      - name: Ensure Speaker Bio page
+        env:
+          SSH_HOST: ${{ secrets.SITEGROUND_SSH_HOST }}
+          SSH_USER: ${{ secrets.SITEGROUND_SSH_USER }}
+          SSH_PASSPHRASE: ${{ secrets.SITEGROUND_SSH_PASSPHRASE }}
+          SSH_PORT: 18765
+          WP_PATH: ${{ secrets.SITEGROUND_WP_PATH }}
+        run: |
+          # Restart SSH agent and re-add key for this step
+          eval "$(ssh-agent -s)"
+
+          # Add key with passphrase if provided
+          if [ -n "$SSH_PASSPHRASE" ]; then
+            expect -c "
+              set timeout 10
+              spawn ssh-add $::env(HOME)/.ssh/id_ed25519
+              expect \"Enter passphrase for\"
+              send \"$::env(SSH_PASSPHRASE)\r\"
+              expect eof
+            "
+          else
+            ssh-add ~/.ssh/id_ed25519
+          fi
+
+          SLUG="speaker-bio"
+          TITLE="Speaker"
+          DEFAULT_CONTENT="<h1>Speaker Bio</h1><p>Coming soon.</p>"
+
+          echo "Checking if Speaker Bio page exists..."
+
+          # Check if page exists
+          page_id=$(ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+            "cd $WP_PATH && wp post list --post_type=page --name='$SLUG' --field=ID --format=csv" 2>/dev/null | head -n1)
+
+          if [ -z "$page_id" ] || [ "$page_id" = "ID" ]; then
+            echo "Page not found, creating fallback page..."
+            new_page_id=$(ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+              "cd $WP_PATH && wp post create --post_type=page --post_title='$TITLE' --post_name='$SLUG' --post_content='$DEFAULT_CONTENT' --post_status=publish --porcelain")
+
+            if [ $? -eq 0 ] && [ -n "$new_page_id" ]; then
+              echo "✓ Created fallback page $SLUG (#$new_page_id)"
+              page_id=$new_page_id
+            else
+              echo "✗ Failed to create page"
+              exit 1
+            fi
+          else
+            echo "✓ Page exists: $SLUG (#$page_id)"
+
+            # Get page URL
+            page_url=$(ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST \
+              "cd $WP_PATH && wp post list --post_type=page --p=$page_id --field=url --format=csv" 2>/dev/null | tail -n1)
+
+            if [ -n "$page_url" ]; then
+              echo "Page URL: $page_url"
+            fi
+          fi
+
